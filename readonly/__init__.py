@@ -21,12 +21,31 @@ else:
 from django.utils.log import getLogger
 from .exceptions import DatabaseWriteDenied
 
+from django.db.backends.mysql.base import CursorWrapper as MySQLCursorWrapper
 
 logger = getLogger('django.db.backends')
+
+SITE_READ_ONLY_DB_USERS = getattr(settings, "SITE_READ_ONLY_DB_USERS", [])
 
 
 def _readonly():
     return getattr(settings, 'SITE_READ_ONLY', False)
+
+def _has_readonly_users():
+    return bool(SITE_READ_ONLY_DB_USERS)
+
+def _is_mysql_cursor(cursor):
+    return isinstance(cursor, MySQLCursorWrapper)
+
+def _is_read_only_user(cursor):
+    """
+    Compares the user in use by the MySQL cursor to SITE_READ_ONLY_DB_USERS
+    """
+    read_only_user = False
+    # FIX ME: Not attempting other backends just yet.  YAGNI.
+    if _is_mysql_cursor(cursor):
+        read_only_user = cursor.cursor.connection.user in SITE_READ_ONLY_DB_USERS
+    return read_only_user
 
 
 class ReadOnlyCursorWrapper(object):
@@ -58,16 +77,22 @@ class ReadOnlyCursorWrapper(object):
         self.cursor = cursor
         self.readonly = _readonly()
 
-    def execute(self, sql, params=()):
+    def evaluate_for_write(self, sql):
         # Check the SQL
-        if self.readonly and self._write_sql(sql):
+        sql_will_write = self._write_sql(sql)
+        if self.readonly and sql_will_write:
             raise DatabaseWriteDenied
+        elif _is_read_only_user(self.cursor) and sql_will_write:
+            raise DatabaseWriteDenied
+        else:
+            pass
+
+    def execute(self, sql, params=()):
+        self.evaluate_for_write(sql)
         return self.cursor.execute(sql, params)
 
     def executemany(self, sql, param_list):
-        # Check the SQL
-        if self.readonly and self._write_sql(sql):
-            raise DatabaseWriteDenied
+        self.evaluate_for_write(sql)
         return self.cursor.executemany(sql, param_list)
 
     def __getattr__(self, attr):
@@ -123,7 +148,7 @@ class CursorDebugWrapper(CursorWrapper):
                 extra={'duration': duration, 'sql': sql, 'params': param_list}
             )
 
-if _readonly():
+if _readonly() or _has_readonly_users():
     # Monkey Patching!
     util.CursorWrapper = CursorWrapper
     util.CursorDebugWrapper = CursorDebugWrapper
